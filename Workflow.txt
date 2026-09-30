@@ -1,0 +1,64 @@
+Fase 0 — Setup e assunzioni di progetto
+•	Formato immagine: ecografia in DICOM (o equivalente), pixel array in grayscale, bit depth da verificare (8/10/12/16 bit) perché cambia i calcoli di DWT/DCT/IWT.
+•	Modello di minaccia: nessun attaccante malevolo attivo; il Livello 1 deve resistere a manomissioni involontarie (compressione, crop, resize), non a un avversario che sa cosa sta cercando.
+•	Requisito di consegna clinica: al medico deve arrivare un'immagine bit-esatta nella ROI diagnostica.
+•	Ruoli dei due livelli (decisione con il prof): 
+o	Livello 1 = Patient_ID pseudonimo, robusto, non rimovibile, confinato alla RONI.
+o	Livello 2 = catena dei possessori, reversibile, multiplo, su ROI+RONI.
+Fase 1 — Preprocessing
+1.	Carica l'immagine (pixel array DICOM o file immagine), converti in grayscale se necessario.
+2.	Fai padding delle dimensioni a multipli di 2^(livelli DWT) × block_size, così DWT/IWT e divisione a blocchi tornano puliti senza bordi irregolari.
+3.	Salva la shape originale, per ritagliare il padding alla fine.
+4.	Segmentazione ROI/RONI: genera una maschera binaria che distingue l'area diagnostica (ROI, tipicamente il cono acustico con i tessuti) dallo sfondo/margini/testo overlay (RONI). Metodo tipico: sogliatura sull'intensità + eventuale morfologia (erosione/dilatazione) per pulire la maschera, o edge detection sul contorno del cono acustico. 
+o	Salva la maschera: deve essere rigenerabile identica in estrazione, quindi o la deriva in modo deterministico dall'immagine marcata (stesso algoritmo, stessa soglia), oppure la memorizzi a parte in modo sicuro. La prima opzione è più fragile ad attacchi ma non richiede storage separato; valuta quale preferisci in base al requisito di robustezza.
+o	Verifica su tutto il dataset che la segmentazione sia stabile: un errore di maschera che classifica pixel ROI come RONI farebbe finire watermark L1 dentro l'area diagnostica.
+Fase 2 — Livello 1: robusto, confinato alla RONI (DWT-DCT-SVD)
+Payload: Patient_ID pseudonimo (64-128 bit, da definire dopo la stima di capacità) + ECC.
+Passi:
+1.	pywt.dwt2(img, 'haar') → ottieni LL, (LH, HL, HH). Scegli una subband di media frequenza (LH o HL) per il compromesso invisibilità/robustezza — LL è troppo percettibile, HH si perde con compressioni leggere.
+2.	Applica la maschera RONI alla subband scelta (ricorda: la subband ha risoluzione dimezzata rispetto all'originale, quindi la maschera va ridimensionata di conseguenza). Identifica quali blocchi cadono interamente o quasi nella RONI — solo questi sono candidati.
+3.	Dividi i blocchi RONI selezionati in sotto-blocchi (es. 8×8), applica la DCT a ciascuno: concentra l'energia sui coefficienti a media frequenza, i meno percettibili e i più stabili sotto compressione JPEG.
+4.	Su una sotto-matrice di coefficienti DCT (≥ 8×8), calcola U, S, Vt = np.linalg.svd(...).
+5.	Modifica il valore singolare più grande (o i primi due) secondo il bit da codificare, con dither modulation:
+S[0] = round(S[0]/Q) * Q + (Q/4 if bit==1 else -Q/4)
+— Q è il passo di quantizzazione: più alto = più robusto ma più visibile, va calibrato con i test di PSNR/BER.
+6.	Ricostruisci: SVD inversa → IDCT → riassembla la subband → IDWT.
+7.	Codifica il payload: Patient_ID (pseudonimo) + ECC (Reed-Solomon o BCH, per correggere errori residui dopo il voto di maggioranza). Ripeti l'intero payload codificato su tutti i blocchi RONI disponibili. 
+o	Prima di fissare la lunghezza del payload, calcola: n_blocchi_RONI / ridondanza_minima ≥ lunghezza_payload_in_bit. Se non torna, riduci Patient_ID a un hash più corto o accetta meno ridondanza (trade-off con la robustezza a crop aggressivo).
+Estrazione L1: DWT → isola blocchi RONI (via maschera) → DCT → SVD per blocco → confronta S[0] con la soglia di quantizzazione per ricavare il bit → voto di maggioranza su tutte le copie → decodifica ECC → Patient_ID.
+Fase 3 — Livello 2: reversibile e multiplo, su ROI+RONI (IWT-DE)
+Payload: catena dei possessori, un blocco per ogni nuovo accesso/passaggio di mano.
+Passi:
+1.	Applica una IWT a coefficienti interi (lifting scheme Haar integer-to-integer) sull'immagine già marcata dal Livello 1 — necessaria per garantire reversibilità bit-esatta (a differenza della DWT float usata in L1).
+2.	Sulle bande HL/LH, su tutta l'immagine (non solo RONI, per avere capacità sufficiente ad accumulare più possessori nel tempo), implementa la Difference Expansion di Tian: 
+o	Per ogni coppia di coefficienti (x, y): l = floor((x+y)/2), h = x - y.
+o	Se h è espandibile (nessun overflow/underflow dopo l'espansione): h' = 2*h + bit; altrimenti h resta invariato e la coppia viene marcata come non-espandibile.
+o	Costruisci la location map (bitmap espandibile/non-espandibile), comprimila (run-length o codifica aritmetica) ed embeddala per prima, in una zona a bassa capacità ma priorità di estrazione garantita — senza di essa l'estrazione esatta non è possibile.
+o	Ricostruisci x', y' da l, h'.
+3.	Costruisci il blocco payload per il possessore corrente:
+Owner_ID | Timestamp | Hash_prev | Hash(Patient_ID) | ECC 
+o	Hash_prev = hash del blocco payload del possessore precedente (catena di custodia, stile blockchain semplificato). Per il primo possessore, Hash_prev è nullo o un valore convenzionale.
+o	Hash(Patient_ID) = hash dell'ID estratto dal Livello 1: lega crittograficamente i due livelli, così una catena "trapiantata" su un'immagine di un altro paziente viene rilevata come incoerente in estrazione.
+o	ECC generato con reedsolo.RSCodec(n_parità).encode(payload_bytes).
+o	I blocchi si accumulano in sequenza: Payload_1 → Payload_2 → ... → Payload_N.
+4.	Inserisci i bit di location map + payload nelle coppie espandibili, fino a esaurimento capacità. Monitora la capacità residua a ogni nuovo possessore aggiunto: se satura, valuta compressione del payload o riduzione della ridondanza ECC (compromesso da documentare).
+5.	IWT inversa → immagine finale: Livello 1 (RONI) + Livello 2 (ROI+RONI, con l'ultimo payload incluso).
+Fase 4 — Estrazione e gestione della catena di custodia
+•	Estrazione L2: IWT → leggi la location map → reverse DE sulle coppie espandibili → payload (ultimo blocco della catena) + immagine esatta pre-embedding-corrente.
+•	Verifica ECC: correggi errori minori o rileva corruzione grave via Reed-Solomon.
+•	Verifica hash chain: Hash_prev di ogni blocco deve corrispondere all'hash del blocco precedente, per validare l'integrità dell'intera catena.
+•	Verifica coerenza tra livelli: Hash(Patient_ID) nel Livello 2 deve coincidere con l'ID estratto dal Livello 1. Se non coincide → segnala anomalia (possibile immagine con catena non pertinente).
+•	Fallback su corruzione L2: se il Livello 2 non è decodificabile (es. dopo compressione JPEG), estrai comunque il Livello 1 → recuperi il Patient_ID, ma non la catena dei possessori. Comportamento atteso e da documentare esplicitamente nei requisiti.
+•	Aggiunta di un nuovo possessore: 
+1.	Estrai/rimuovi il Livello 2 esistente (reversal completo via location map) → torni all'immagine pre-Livello-2-corrente.
+2.	Costruisci il nuovo blocco payload con Hash_prev aggiornato all'hash dell'ultimo blocco della catena.
+3.	Re-embedda con DE (nuova location map, perché lo stato dei coefficienti è cambiato rispetto al giro precedente).
+•	Consegna al medico: rimuovi il Livello 2 (reversal completo → immagine bit-esatta). Il Livello 1 resta, ma essendo confinato alla RONI non tocca l'area diagnostica.
+Fase 5 — Validazione
+•	PSNR/SSIM separati per l'impatto del Livello 1 (solo RONI) e del Livello 2 (ROI+RONI), per isolare quale contributo pesa di più sulla qualità percepita.
+•	Simulazione attacchi: JPEG a varie qualità, crop (incluso crop aggressivo sulla RONI, per testare il limite della ridondanza L1), resize, rumore gaussiano.
+•	BER del Patient_ID (L1) dopo ogni attacco — più critico del semplice "ID leggibile/non leggibile": un ID decodificato in modo errato dopo l'ECC è peggio di un ID illeggibile, perché lega l'immagine al paziente sbagliato. Aggiungi un checksum nel payload per distinguere i due casi.
+•	Reversibilità: dopo remove del Livello 2 (per ciascun possessore accumulato), confronto bit-a-bit con l'immagine allo stato precedente — deve essere identica al 100%.
+•	Capacità L1: numero di blocchi RONI utili sul dataset reale, verifica che Patient_ID + ECC ci entri con la ridondanza target.
+•	Capacità L2: quanti possessori si possono accumulare in catena prima di saturare la capacità o superare la soglia di distorsione accettabile.
+•	Stabilità segmentazione ROI/RONI: nessun leak di embedding L1 dentro la ROI su tutto il dataset di test.
