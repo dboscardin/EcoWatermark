@@ -1,0 +1,46 @@
+=== 01_original_image ===
+Shape: (576, 414), dtype: uint16
+Min: 0, Max: 538
+
+=== 02_padded_image ===
+Shape originale: (576, 414) → Shape con padding: (576, 416)
+
+=== 03_roni_mask ===
+Pixel RONI (255): 116793  (48.7%)
+Pixel ROI  (0)  : 122823  (51.3%)
+
+=== 04_L1_subband_LH_original ===
+Sottobanda LH prima dell'embedding L1
+Shape: (288, 208), Min: -161.50, Max: 173.00
+
+=== 05_L1_subband_LH_watermarked ===
+Sottobanda LH dopo embedding L1 (DWT-DCT)
+Shape: (288, 208), Bit embeddati: 144, Blocchi RONI usati: 395
+Differenza media |LH_wm - LH|: 0.2187
+
+=== 06_L1_watermarked_image ===
+Immagine dopo watermarking L1 (IDWT)
+Shape: (576, 416), PSNR rispetto all'originale con padding: 63.73 dB
+
+=== 07_L2_band_HL_original ===
+Banda HL (IWT) prima dell'embedding L2
+Shape: (288, 208), Min: -173, Max: 161
+Struttura payload: 4 slot × 8B + 4B pid_hash = 36B grezzo + ECC = 46B
+
+=== 08_L2_band_HL_watermarked ===
+Banda HL dopo embedding L2 (DE)
+Shape: (288, 208), Coppie usate: 368, Bit embeddati: 368/368
+Proprietari attivi: 1/4
+
+=== 09_L2_final_watermarked_image ===
+Immagine finale dopo watermarking L1+L2
+Shape: (576, 416), PSNR rispetto all'originale con padding: 63.49 dB
+Differenza media assoluta: 0.1010
+
+=== 10_L2_extraction_result ===
+  Slot 1: owner_hash=aecb709d  timestamp=1793799131
+  Slot 2: [vuoto]
+  Slot 3: [vuoto]
+  Slot 4: [vuoto]
+[L2 estrazione] pid_hash estratto: b3ab83f4  OK=True
+
