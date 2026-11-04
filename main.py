@@ -9,8 +9,9 @@ import struct
 import reedsolo
 import pywt
 import time
-import os
+import os, sys
 from scipy.fft import dctn, idctn
+from PIL import Image
 
 # --------- SALVATAGGIO OUTPUT INTERMEDI ---------
 OUTPUT_DIR = "outputs"
@@ -345,6 +346,71 @@ def decompress_locmap(data_bytes, n_pairs):
     bits = np.unpackbits(np.frombuffer(packed, dtype=np.uint8))
     return [bool(b) for b in bits[:n_pairs]]
 
+# --------- FUNZIONI DI ATTACCO ---------
+import random
+import io
+
+def jpeg2000_attack(image_np, compression_ratio=10):
+    """
+    Simula compressione JPEG2000 (supporta uint16) tramite OpenCV.
+    compression_ratio : fattore di compressione (10 = 10:1, più alto = più perdita)
+    Ritorna array dello stesso dtype dell'input.
+    """
+    encode_param = [cv2.IMWRITE_JPEG2000_COMPRESSION_X1000,
+                    int(1000 / compression_ratio)]
+    _, encoded = cv2.imencode('.jp2', image_np, encode_param)
+    attacked = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    return attacked.astype(image_np.dtype)
+
+def crop_attack(image_np, crop_frac=0.1):
+    """
+    Ritaglia l'immagine rimuovendo crop_frac della dimensione su ogni lato,
+    poi la riporta alle dimensioni originali paddando SOLO in basso e a destra.
+    Così il contenuto rimasto è allineato in alto a sinistra come nell'originale:
+    i blocchi embeddati mantengono la stessa posizione e l'estrazione funziona
+    su tutto il contenuto non croppato.
+    image_np  : numpy array
+    crop_frac : frazione di pixel rimossi per lato (default 10%)
+    """
+    h, w = image_np.shape
+    dy = max(1, int(h * crop_frac))
+    dx = max(1, int(w * crop_frac))
+    # Croppa solo dal basso e da destra: l'angolo in alto a sinistra resta intatto
+    cropped = image_np[:h - dy, :w - dx]
+    # Ripadda in basso e a destra per riportare alle dimensioni originali
+    attacked = np.pad(cropped,
+                      ((0, dy), (0, dx)),
+                      mode='constant', constant_values=0)
+    assert attacked.shape == image_np.shape
+    return attacked
+
+def noise_attack(image_np, std=5.0):
+    """
+    Aggiunge rumore gaussiano additivo.
+    image_np : numpy array (qualsiasi dtype)
+    std      : deviazione standard del rumore (in livelli di intensità)
+    Ritorna array dello stesso dtype e shape, con clip al range originale.
+    """
+    noise = np.random.normal(0, std, image_np.shape)
+    attacked = np.clip(image_np.astype(np.float64) + noise,
+                       0, np.iinfo(image_np.dtype).max)
+    return attacked.astype(image_np.dtype)
+
+def extract_l1_ber(attacked_np, roni_blocks, payload_bits,
+                   rows, cols, dwt_levels=1, block_size=8):
+    """
+    Estrae il watermark L1 dall'immagine attaccata e calcola il BER
+    rispetto ai bit originali del payload.
+    Ritorna (ber, n_bit_estratti, bit_estratti).
+    """
+    attacked_f = attacked_np.astype(np.float64)
+    _, (LH_att, _, _) = pywt.dwt2(attacked_f, 'haar')
+    extracted = [extract_bit(dctn(get_block(LH_att, r, c), norm='ortho'))
+                 for r, c in roni_blocks[:len(payload_bits)]]
+    ber = float(np.mean(np.array(extracted) != np.array(payload_bits)))
+    return ber, len(extracted), extracted
+
+
 def bits_to_bytes(bits):
     out = []
     for i in range(0, len(bits) - 7, 8):
@@ -381,12 +447,11 @@ def de_extract_blind(band_wm, n_bits, bit_depth=8):
 
     return band_orig, extracted
 
-    
 # ---------------------------------
 
 # --------- PREPROCESSING --------- 
 # Caricamento immagine
-file_path = "images/005.dcm"
+file_path = "images/001.dcm"
 dataset = pydicom.dcmread(file_path)
 print(f"ID Paziente: {dataset.PatientID}")
 print(f"Modalita': {dataset.Modality}")      # US = UltraSound
@@ -695,3 +760,38 @@ except reedsolo.ReedSolomonError as e:
         log_text=f"Errore ECC durante estrazione L2: {e}")
 # --------- Estrazione e block-chain --------- 
 # --------- Validazione --------- 
+
+# --------- ATTACCHI ---------
+print("\n" + "="*50)
+print("TEST DI ROBUSTEZZA")
+print("="*50)
+
+attacks = {
+    "JP2 ratio=5"  : jpeg2000_attack(wm_final, compression_ratio=5),
+    "JP2 ratio=10" : jpeg2000_attack(wm_final, compression_ratio=10),
+    "JP2 ratio=20" : jpeg2000_attack(wm_final, compression_ratio=20),
+    "Crop 10%"     : crop_attack(wm_final, crop_frac=0.10),
+    "Rumore σ=2"   : noise_attack(wm_final, std=2.0),
+    "Rumore σ=5"   : noise_attack(wm_final, std=5.0),
+    "Rumore σ=10"  : noise_attack(wm_final, std=10.0),
+}
+
+log_attack_lines = []
+for name, attacked in attacks.items():
+    ber, n_bits, extracted_bits = extract_l1_ber(attacked, roni_blocks, payload_bits,
+                                                  dataset.Rows, dataset.Columns)
+    # Verifica ECC sui bit già estratti (non ricalcola)
+    try:
+        rs = reedsolo.RSCodec(10)
+        rs.decode(bits_to_bytes(extracted_bits))
+        ecc_ok = True
+    except reedsolo.ReedSolomonError:
+        ecc_ok = False
+
+    line = (f"  {name:<15} | BER={ber:.4f} ({int(ber*n_bits)}/{n_bits} bit errati)"
+            f" | ECC recupero={'OK' if ecc_ok else 'FALLITO'}")
+    print(line)
+    log_attack_lines.append(line)
+
+save_intermediate("11_robustness_attacks", None,
+    log_text="Test di robustezza L1\n" + "\n".join(log_attack_lines))
